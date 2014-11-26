@@ -12,9 +12,7 @@ The result will be a XML file containing the PAC data.
 Configuration reference
 -----------------------
 
-    auth_gss_pac [on|off] : this will enable the parsing of the pac data
-	
-    auth_gss_pac_cache_dir [path + trailing slash] : the path where to cache the PAC XML (default: /tmp/)
-	
-    auth_gss_pac_cache_time [number] : time in seconds, were the cache file will not be updated, to save performance (default: 1 hour - 3600 seconds)
+ * `auth_gss_pac [on|off]` : this will enable the parsing of the pac data
+ * `auth_gss_pac_cache_dir [path + trailing slash]` : the path where to cache the PAC XML (default: /tmp/)
+ * `auth_gss_pac_cache_time [number]` : time in seconds, were the cache file will not be updated, to save performance (default: 1 hour - 3600 seconds)
 	
