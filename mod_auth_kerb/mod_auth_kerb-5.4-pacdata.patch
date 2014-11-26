@@ -1,0 +1,1218 @@
+diff -rupN a/Makefile.in b/Makefile.in
+--- a/Makefile.in	2008-12-02 15:07:10.000000000 +0100
++++ b/Makefile.in	2014-11-25 13:13:17.344484471 +0100
+@@ -5,6 +5,7 @@ KRB4_CPPFLAGS = @KRB4_CPPFLAGS@
+ KRB4_LDFLAGS = @KRB4_LDFLAGS@
+ LIB_resolv = @LIB_resolv@
+ SPNEGO_SRCS = @SPNEGO_SRCS@
++PAC_SRCS = src/pac_gssapi.c src/pac_xml_dump.c
+ 
+ CPPFLAGS = -I. -Ispnegokrb5 $(KRB5_CPPFLAGS) $(KRB4_CPPFLAGS) $(DEFS)
+ LDFLAGS = $(KRB5_LDFLAGS) $(KRB4_LDFLAGS) $(LIB_resolv)
+@@ -12,11 +13,11 @@ CFLAGS =
+ 
+ all: src/mod_auth_kerb.so
+ 
+-src/mod_auth_kerb.so: src/mod_auth_kerb.c $(SPNEGO_SRCS)
+-	./apxs.sh "${CPPFLAGS}" "${LDFLAGS}" "${SPNEGO_SRCS}" "${APXS}" "-c" "src/mod_auth_kerb.c"
++src/mod_auth_kerb.so: src/mod_auth_kerb.c $(PAC_SRCS) $(SPNEGO_SRCS)
++	./apxs.sh "${CPPFLAGS}" "${LDFLAGS}" "${SPNEGO_SRCS} ${PAC_SRCS}" "${APXS}" "-c" "src/mod_auth_kerb.c"
+ 
+ install:
+-	./apxs.sh "${CPPFLAGS}" "${LDFLAGS}" "${SPNEGO_SRCS}" "${APXS}" "-c -i" "src/mod_auth_kerb.c"
++	./apxs.sh "${CPPFLAGS}" "${LDFLAGS}" "${SPNEGO_SRCS} ${PAC_SRCS}" "${APXS}" "-c -i" "src/mod_auth_kerb.c"
+ 
+ clean:
+ 	for i in . src spnegokrb5; do \
+diff -rupN a/src/mod_auth_kerb.c b/src/mod_auth_kerb.c
+--- a/src/mod_auth_kerb.c	2008-12-04 11:14:03.000000000 +0100
++++ b/src/mod_auth_kerb.c	2014-11-26 08:51:00.000000000 +0100
+@@ -8,6 +8,7 @@
+  *   James E. Robinson, III <james@ncstate.net>
+  *   Daniel Henninger <daniel@ncsu.edu>
+  *   Ludek Sulak <xsulak@fi.muni.cz>
++ *   Sven Fabricius <sven.fabricius@livediesel.de>
+  */
+ 
+ /*
+@@ -98,6 +99,8 @@
+ #  define GSS_KRB5_NT_PRINCIPAL_NAME gss_nt_krb5_name
+ #  define krb5_get_err_text(context,code) error_message(code)
+ #endif
++#include "pac_gssapi.h"
++#include "pac_xml_dump.h"
+ #ifndef GSSAPI_SUPPORTS_SPNEGO
+ #  include "spnegokrb5.h"
+ #endif
+@@ -170,6 +173,11 @@ typedef struct {
+ 	char *krb_4_srvtab;
+ 	int krb_method_k4pass;
+ #endif
++#ifdef KRB5
++	int krb_pac_dump;
++	int krb_pac_cache_time;
++	char *krb_pac_cache_dir;
++#endif
+ } kerb_auth_config;
+ 
+ typedef struct krb5_conn_data {
+@@ -247,6 +255,17 @@ static const command_rec kerb_auth_cmds[
+      FLAG, "Enable Kerberos V4 password authentication."),
+ #endif
+ 
++#ifdef KRB5
++   command("KrbPacDump", ap_set_flag_slot, krb_pac_dump,
++     FLAG, "Dump Kerberos PAC data."),
++	 
++   command("KrbPacCacheTime", ap_set_int_slot, krb_pac_cache_time,
++     TAKE1, "Cache time for Kerberos PAC data."),
++	 
++   command("KrbPacCacheDir", ap_set_string_slot, krb_pac_cache_dir,
++     TAKE1, "Cache directory for Kerberos PAC data."),
++#endif 
++
+    { NULL }
+ };
+ 
+@@ -336,6 +355,11 @@ static void *kerb_dir_create_config(MK_P
+ #ifdef KRB4
+ 	((kerb_auth_config *)rec)->krb_method_k4pass = 1;
+ #endif
++#ifdef KRB5
++	((kerb_auth_config *)rec)->krb_pac_dump = 0;
++	((kerb_auth_config *)rec)->krb_pac_cache_time = 3600;
++	((kerb_auth_config *)rec)->krb_pac_cache_dir = NULL;
++#endif
+ 	return rec;
+ }
+ 
+@@ -1327,6 +1351,7 @@ authenticate_user_gss(request_rec *r, ke
+   gss_ctx_id_t context = GSS_C_NO_CONTEXT;
+   gss_cred_id_t server_creds = GSS_C_NO_CREDENTIAL;
+   OM_uint32 ret_flags = 0;
++  gss_buffer_desc pac_buffer = GSS_C_EMPTY_BUFFER;
+ 
+   *negotiate_ret_value = "\0";
+ 
+@@ -1449,7 +1474,6 @@ authenticate_user_gss(request_rec *r, ke
+ #endif
+ 
+   major_status = gss_display_name(&minor_status, client_name, &output_token, NULL);
+-  gss_release_name(&minor_status, &client_name); 
+   if (GSS_ERROR(major_status)) {
+     log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+ 	       "%s", get_gss_error(r, major_status, minor_status,
+@@ -1457,9 +1481,37 @@ authenticate_user_gss(request_rec *r, ke
+     ret = HTTP_INTERNAL_SERVER_ERROR;
+     goto end;
+   }
+-
++  
+   MK_AUTH_TYPE = MECH_NEGOTIATE;
+   MK_USER = apr_pstrdup(r->pool, output_token.value);
++  
++  if (conf->krb_pac_dump) {
++    major_status = gssapi_obtain_pac(&minor_status, context, client_name, &pac_buffer);
++    if (GSS_ERROR(major_status)) {
++      log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
++	       "%s", get_gss_error(r, major_status, minor_status,
++		                   "gssapi_obtain_pac() failed"));
++    }
++    else {
++      char *pacfile;
++      char *pacfile_p = NULL;
++
++      if (conf->krb_pac_cache_dir) {
++	    pacfile = malloc(strlen(".xml") + strlen(conf->krb_pac_cache_dir) + strlen(MK_USER) + 1);
++        sprintf(pacfile, "%s%s.xml\0", conf->krb_pac_cache_dir, MK_USER);
++	  } 
++	  else {
++	    pacfile = malloc(strlen("/tmp/.xml") + strlen(MK_USER) + 1);
++        sprintf(pacfile, "/tmp/%s.xml\0", MK_USER);
++	  }
++      pac_to_xml_file(pac_buffer.length, pac_buffer.value, (const char*)pacfile, conf->krb_pac_cache_time);
++	  gss_release_buffer(&minor_status, &pac_buffer);
++	  
++      pacfile_p = apr_pstrdup(r->pool, pacfile);
++      apr_table_setn(r->subprocess_env, "KRB5PACNAME", pacfile_p);
++    }
++  }
++  gss_release_name(&minor_status, &client_name); 
+ 
+   if (conf->krb_save_credentials && delegated_cred != GSS_C_NO_CREDENTIAL)
+      store_gss_creds(r, conf, (char *)output_token.value, delegated_cred);
+@@ -1472,6 +1524,9 @@ end:
+   if (delegated_cred)
+      gss_release_cred(&minor_status, &delegated_cred);
+ 
++  if (pac_buffer.length)
++     gss_release_buffer(&minor_status, &pac_buffer);
++
+   if (output_token.length) 
+      gss_release_buffer(&minor_status, &output_token);
+ 
+diff -rupN a/src/pac_collected.h b/src/pac_collected.h
+--- a/src/pac_collected.h	1970-01-01 01:00:00.000000000 +0100
++++ b/src/pac_collected.h	2014-11-24 15:17:27.000000000 +0100
+@@ -0,0 +1,131 @@
++/*
++ * Copyright (C) 2014 Sven Fabricius <sven.fabricius{at}livediesel[dot]de>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * Collected constants and structs of various kerberos, gssapi and samba header files
++ * http://msdn.microsoft.com/en-us/library/aa302203.aspx
++ */
++
++#ifndef PAC_COLLECTED_H_
++#define PAC_COLLECTED_H_
++
++#define PAC_INFO_BUFFER_LENGTH           16
++#define PACTYPE_LENGTH                   8U
++#define CKSUM_LENGTH                     4
++#define CLIENT_INFO_LENGTH               10
++#define PAC_ALIGNMENT                    8
++#define NT_TIME_EPOCH                    11644473600LL
++#define KRB5_INT32_MAX                   2147483647
++
++#define KRB5_PAC_LOGON_INFO              1  /**< Logon information */
++#define KRB5_PAC_CREDENTIALS_INFO        2  /**< Credentials information */
++#define KRB5_PAC_SERVER_CHECKSUM         6  /**< Server checksum */
++#define KRB5_PAC_PRIVSVR_CHECKSUM        7  /**< KDC checksum */
++#define KRB5_PAC_CLIENT_INFO             10 /**< Client name and ticket info */
++#define KRB5_PAC_DELEGATION_INFO         11 /**< Constrained delegation info */
++#define KRB5_PAC_UPN_DNS_INFO            12 /**< User principal name and DNS info */
++
++#define NETLOGON_GUEST                   0x00000001
++#define NETLOGON_NOENCRYPTION            0x00000002
++#define NETLOGON_CACHED_ACCOUNT          0x00000004
++#define NETLOGON_USED_LM_PASSWORD        0x00000008
++#define NETLOGON_EXTRA_SIDS              0x00000020
++#define NETLOGON_SUBAUTH_SESSION_KEY     0x00000040
++#define NETLOGON_SERVER_TRUST_ACCOUNT    0x00000080
++#define NETLOGON_NTLMV2_ENABLED          0x00000100
++#define NETLOGON_RESOURCE_GROUPS         0x00000200
++#define NETLOGON_PROFILE_PATH_RETURNED   0x00000400
++#define NETLOGON_GRACE_LOGON             0x01000000
++
++#define SE_GROUP_MANDATORY               0x00000001
++#define SE_GROUP_ENABLED_BY_DEFAULT      0x00000002
++#define SE_GROUP_ENABLED                 0x00000004
++#define SE_GROUP_OWNER                   0x00000008
++#define SE_GROUP_USE_FOR_DENY_ONLY       0x00000010
++#define SE_GROUP_INTEGRITY               0x00000020
++#define SE_GROUP_INTEGRITY_ENABLED       0x00000040
++#define SE_GROUP_RESOURCE                0x20000000
++#define SE_GROUP_LOGON_ID                0xC0000000
++
++#ifdef CKSUMTYPE_CRC32
++#undef CKSUMTYPE_CRC32
++#endif
++#ifdef CKSUMTYPE_RSA_MD4
++#undef CKSUMTYPE_RSA_MD4
++#endif
++#ifdef CKSUMTYPE_RSA_MD4_DES
++#undef CKSUMTYPE_RSA_MD4_DES
++#endif
++#ifdef CKSUMTYPE_RSA_MD5
++#undef CKSUMTYPE_RSA_MD5
++#endif
++#ifdef CKSUMTYPE_RSA_MD5_DES
++#undef CKSUMTYPE_RSA_MD5_DES
++#endif
++#ifdef CKSUMTYPE_HMAC_SHA1_DES3
++#undef CKSUMTYPE_HMAC_SHA1_DES3
++#endif
++
++#define CKSUMTYPE_NONE                   0
++#define CKSUMTYPE_CRC32                  1
++#define CKSUMTYPE_RSA_MD4                2
++#define CKSUMTYPE_RSA_MD4_DES            3
++#define CKSUMTYPE_DES_MAC                4
++#define CKSUMTYPE_DES_MAC_K              5
++#define CKSUMTYPE_RSA_MD4_DES_K          6
++#define CKSUMTYPE_RSA_MD5                7
++#define CKSUMTYPE_RSA_MD5_DES            8
++#define CKSUMTYPE_RSA_MD5_DES3           9
++#define CKSUMTYPE_SHA1_OTHER             10
++#define CKSUMTYPE_HMAC_SHA1_DES3         12
++#define CKSUMTYPE_SHA1                   14
++#define CKSUMTYPE_HMAC_SHA1_96_AES_128   15
++#define CKSUMTYPE_HMAC_SHA1_96_AES_256   16
++#define CKSUMTYPE_GSSAPI                 32771
++#define CKSUMTYPE_HMAC_MD5               -138
++#define CKSUMTYPE_HMAC_MD5_ENC           -1138
++
++typedef struct _PAC_INFO_BUFFER {
++    uint32_t ulType;
++    uint32_t cbBufferSize;
++    uint64_t Offset;
++} PAC_INFO_BUFFER;
++
++typedef struct _PACTYPE {
++    uint32_t cBuffers;
++    uint32_t Version;
++    PAC_INFO_BUFFER Buffers[1];
++} PACTYPE;
++
++typedef struct {
++    uint32_t g_rid;
++    uint32_t attr;
++} DOM_GID;
++
++typedef struct {
++    uint16_t uni_str_len;
++    uint16_t uni_max_len;
++    uint32_t buffer;
++} UNIHDR;
++
++#endif /* PAC_COLLECTED_H_ */
+diff -rupN a/src/pac_gssapi.c b/src/pac_gssapi.c
+--- a/src/pac_gssapi.c	1970-01-01 01:00:00.000000000 +0100
++++ b/src/pac_gssapi.c	2014-11-24 15:19:10.000000000 +0100
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (C) 2014 Sven Fabricius <sven.fabricius{at}livediesel[dot]de>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ */
++
++#include <gssapi/gssapi.h>
++#include <gssapi/gssapi_krb5.h>
++
++#include <stdio.h>
++
++int gssapi_obtain_pac(OM_uint32 * gss_min, gss_ctx_id_t ctx, gss_name_t client_name, gss_buffer_desc *pac_buffer)
++{
++    OM_uint32 gss_maj;
++
++    gss_buffer_desc pac_display_buffer = {
++        .value = NULL,
++        .length = 0
++    };
++    gss_buffer_desc pac_name = {
++        .value = (void *)((uintptr_t)("urn:mspac:")),
++        .length = sizeof("urn:mspac:")-1
++    };
++
++    int more = -1;
++    int authenticated = 0;
++    int complete = 0;
++
++    gss_maj = gss_get_name_attribute(gss_min, client_name, &pac_name, &authenticated, &complete, pac_buffer, &pac_display_buffer, &more);
++    if (gss_maj != 0)
++    {
++        return gss_maj;
++    }
++    else if (authenticated && complete)
++    {
++        gss_maj = gss_release_buffer(gss_min, &pac_display_buffer);
++    }
++    else
++    {
++        return gss_maj;
++    }
++    return 0;
++}
+diff -rupN a/src/pac_gssapi.h b/src/pac_gssapi.h
+--- a/src/pac_gssapi.h	1970-01-01 01:00:00.000000000 +0100
++++ b/src/pac_gssapi.h	2014-11-24 15:27:23.000000000 +0100
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) 2014 Sven Fabricius <sven.fabricius{at}livediesel[dot]de>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ */
++
++#ifndef PAC_GSSAPI_H_
++#define PAC_GSSAPI_H_
++
++int gssapi_obtain_pac(OM_uint32 *gss_min, gss_ctx_id_t ctx, gss_name_t client_name, gss_buffer_desc *pac_buffer);
++
++#endif /* PAC_GSSAPI_H_ */
+diff -rupN a/src/pac_xml_dump.c b/src/pac_xml_dump.c
+--- a/src/pac_xml_dump.c	1970-01-01 01:00:00.000000000 +0100
++++ b/src/pac_xml_dump.c	2014-11-24 15:28:31.000000000 +0100
+@@ -0,0 +1,770 @@
++/*
++ * Copyright (C) 2014 Sven Fabricius <sven.fabricius{at}livediesel[dot]de>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ */
++
++#include <stdio.h>
++#include <stdint.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <stdlib.h>
++
++#include "pac_xml_dump.h"
++#include "pac_collected.h"
++
++#ifdef _MSC_VER
++#define STIN static __inline
++#else
++#define STIN static inline
++#endif
++
++STIN uint16_t load_16_le (const unsigned char *p)
++{
++    return (p[0] | (p[1] << 8));
++}
++
++STIN uint32_t load_32_le (const unsigned char *p)
++{
++    return (p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
++}
++
++STIN uint64_t load_64_le (const unsigned char *p)
++{
++    return ((uint64_t)load_32_le(p+4) << 32) | load_32_le(p);
++}
++
++STIN uint64_t load_48_be (const unsigned char *p)
++{
++    return (uint64_t)(p[5] | (p[4] << 8) | (p[3] << 16) | (p[2] << 24) | ((uint64_t)p[1] << 32) | ((uint64_t)p[0] << 40));
++}
++
++/* parse PAC Header, alignment of the info buffers */
++PACTYPE * parse_pac_header(const void *ptr, size_t len)
++{
++    PACTYPE *ppac_header;
++    const unsigned char *p = (const unsigned char *)ptr;
++    uint32_t cbuffers, version;
++    size_t header_len;
++    size_t i;
++
++    if (len < PACTYPE_LENGTH)
++        return NULL;
++
++    cbuffers = load_32_le(p);
++    p += 4;
++    version = load_32_le(p);
++    p += 4;
++
++    if (version != 0)
++        return NULL;
++
++    header_len = PACTYPE_LENGTH + (cbuffers * PAC_INFO_BUFFER_LENGTH);
++    if (len < header_len)
++        return NULL;
++
++    ppac_header = (PACTYPE *)malloc(sizeof(PACTYPE) + ((cbuffers - 1) * sizeof(PAC_INFO_BUFFER)));
++
++    if (ppac_header == NULL)
++        return NULL;
++
++    ppac_header->cBuffers = cbuffers;
++    ppac_header->Version = version;
++
++    for (i = 0; i < ppac_header->cBuffers; i++)
++    {
++        PAC_INFO_BUFFER *buffer = &ppac_header->Buffers[i];
++
++        buffer->ulType = load_32_le(p);
++        p += 4;
++        buffer->cbBufferSize = load_32_le(p);
++        p += 4;
++        buffer->Offset = load_64_le(p);
++        p += 8;
++
++        if (buffer->Offset % PAC_ALIGNMENT)
++        {
++            free(ppac_header);
++            return NULL;
++        }
++        if (buffer->Offset < header_len || buffer->Offset + buffer->cbBufferSize > len)
++        {
++            free(ppac_header);
++            return NULL;
++        }
++    }
++    return ppac_header;
++}
++
++
++/* parse and output a checksum info buffer */
++void parse_checksum(FILE *fp, const void *ptr, PAC_INFO_BUFFER * infoBuffer, const char *name)
++{
++    const unsigned char *p = (const unsigned char *)ptr;
++    int32_t cksumType;
++    size_t i;
++
++    p += infoBuffer->Offset;
++
++    if (infoBuffer->cbBufferSize < CKSUM_LENGTH)
++        return;
++
++    cksumType = load_32_le(p);
++    p += 4;
++    fprintf(fp, "<%s CheckSumType=\"", name);
++
++    switch (cksumType)
++    {
++        case CKSUMTYPE_NONE:
++            fprintf(fp, "NONE");
++            break;
++        case CKSUMTYPE_CRC32:
++            fprintf(fp, "CRC32");
++            break;
++        case CKSUMTYPE_RSA_MD4:
++            fprintf(fp, "RSA_MD4");
++            break;
++        case CKSUMTYPE_RSA_MD4_DES:
++            fprintf(fp, "RSA_MD4_DES");
++            break;
++        case CKSUMTYPE_DES_MAC:
++            fprintf(fp, "DES_MAC");
++            break;
++        case CKSUMTYPE_DES_MAC_K:
++            fprintf(fp, "DES_MAC_K");
++            break;
++        case CKSUMTYPE_RSA_MD4_DES_K:
++            fprintf(fp, "RSA_MD4_DES_K");
++            break;
++        case CKSUMTYPE_RSA_MD5:
++            fprintf(fp, "RSA_MD5");
++            break;
++        case CKSUMTYPE_RSA_MD5_DES:
++            fprintf(fp, "RSA_MD5_DES");
++            break;
++        case CKSUMTYPE_RSA_MD5_DES3:
++            fprintf(fp, "RSA_MD5_DES3");
++            break;
++        case CKSUMTYPE_SHA1_OTHER:
++            fprintf(fp, "SHA1_OTHER");
++            break;
++        case CKSUMTYPE_HMAC_SHA1_DES3:
++            fprintf(fp, "HMAC_SHA1_DES3");
++            break;
++        case CKSUMTYPE_SHA1:
++            fprintf(fp, "SHA1");
++            break;
++        case CKSUMTYPE_HMAC_SHA1_96_AES_128:
++            fprintf(fp, "HMAC_SHA1_96_AES_128");
++            break;
++        case CKSUMTYPE_HMAC_SHA1_96_AES_256:
++            fprintf(fp, "HMAC_SHA1_96_AES_256");
++            break;
++        case CKSUMTYPE_GSSAPI:
++            fprintf(fp, "GSSAPI");
++            break;
++        case CKSUMTYPE_HMAC_MD5:
++            fprintf(fp, "HMAC_MD5");
++            break;
++        case CKSUMTYPE_HMAC_MD5_ENC:
++            fprintf(fp, "HMAC_MD5_ENC");
++            break;
++    }
++    fprintf(fp, "\">");
++    for (i = 4; i < infoBuffer->cbBufferSize; i++)
++    {
++        fprintf(fp, "%02X", *p++);
++    }
++
++    fprintf(fp, "</%s>\n", name);
++}
++
++/* parse and output the UPN DNS info buffer */
++void parse_upn_dns_info(FILE *fp, const void *ptr, PAC_INFO_BUFFER * infoBuffer)
++{
++    const unsigned char *p = (const unsigned char *)ptr;
++    const unsigned char *p1;
++    const unsigned char *p2;
++    uint16_t len;
++    uint16_t pos;
++    size_t i;
++
++    p += infoBuffer->Offset;
++    p1 = p;
++
++    fprintf(fp, "<UPN_DNS_Info>\n");
++    do {
++        len = load_16_le(p);
++        p += 2;
++        pos = load_16_le(p);
++        p += 2;
++        if (len == 0)
++        {
++            fprintf(fp, "</UPN_DNS_Info>\n");
++            return;
++        }
++        p2 = p1 + pos;
++
++        for (i = 0; i < len; i+=2)
++        {
++            fprintf(fp, "%c", *p2++);
++            p2++;
++        }
++        fprintf(fp, "\n");
++    } while(1);
++}
++
++/* convert kerberos timestamp to seconds since 1970 */
++int32_t k5_time_to_seconds_since_1970(int64_t ntTime)
++{
++    uint64_t abstime;
++
++    ntTime /= 10000000;
++
++    abstime = ntTime > 0 ? ntTime - NT_TIME_EPOCH : -ntTime;
++
++    if (abstime > KRB5_INT32_MAX)
++        return 0;
++
++    return abstime;
++}
++
++/* parse and output the client info buffer */
++void parse_client_info(FILE *fp, const void *ptr, PAC_INFO_BUFFER * infoBuffer)
++{
++    const unsigned char *p = (const unsigned char *)ptr;
++    int64_t nt_authtime;
++    uint16_t princname_length;
++    size_t i;
++
++    p += infoBuffer->Offset;
++
++    if (infoBuffer->cbBufferSize < CLIENT_INFO_LENGTH)
++        return;
++
++    nt_authtime = load_64_le(p);
++    p += 8;
++    princname_length = load_16_le(p);
++    p += 2;
++    nt_authtime = k5_time_to_seconds_since_1970(nt_authtime);
++
++    fprintf(fp, "<ClientInfo NTAuthTime=\"%lu\">", nt_authtime);
++
++    for (i = 0; i < princname_length; i+=2)
++    {
++        fprintf(fp, "%c", *p++);
++        p++;
++    }
++
++    fprintf(fp, "</ClientInfo>\n");
++}
++
++
++/* parse and output a kerberos timestamp */
++void parse_k5_time(FILE *fp, const char * format, const unsigned char **p)
++{
++    int64_t nt_time = load_64_le(*p);
++    *p += 8;
++    fprintf(fp, format, k5_time_to_seconds_since_1970(nt_time));
++}
++
++/* parse and output a uint16 value */
++void parse_uint16(FILE *fp, const char * format, const unsigned char **p)
++{
++    uint16_t res = load_16_le(*p);
++    *p += 2;
++    fprintf(fp, format, res);
++}
++
++/* parse and output a uint32 value */
++void parse_uint32(FILE *fp, const char * format, const unsigned char **p)
++{
++    uint32_t res = load_32_le(*p);
++    *p += 4;
++    fprintf(fp, format, res);
++}
++
++/* parse and the user flags */
++void parse_user_flgs(FILE *fp, const uint32_t user_flgs)
++{
++    uint8_t listFlag = 0;
++    if (user_flgs & NETLOGON_GUEST)
++    {
++        fprintf(fp, "GUEST");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_NOENCRYPTION)
++    {
++        fprintf(fp, "%sNOENCRYPTION", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_CACHED_ACCOUNT)
++    {
++        fprintf(fp, "%sCACHED_ACCOUNT", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_USED_LM_PASSWORD)
++    {
++        fprintf(fp, "%sUSED_LM_PASSWORD", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_EXTRA_SIDS)
++    {
++        fprintf(fp, "%sEXTRA_SIDS", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_SUBAUTH_SESSION_KEY)
++    {
++        fprintf(fp, "%sSUBAUTH_SESSION_KEY", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_SERVER_TRUST_ACCOUNT)
++    {
++        fprintf(fp, "%sSERVER_TRUST_ACCOUNT", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_NTLMV2_ENABLED)
++    {
++        fprintf(fp, "%sNTLMV2_ENABLED", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_RESOURCE_GROUPS)
++    {
++        fprintf(fp, "%sRESOURCE_GROUPS", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_PROFILE_PATH_RETURNED)
++    {
++        fprintf(fp, "%sPROFILE_PATH_RETURNED", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (user_flgs & NETLOGON_GRACE_LOGON)
++    {
++        fprintf(fp, "%sGRACE_LOGON", listFlag == 1 ? "," : "");
++    }
++}
++
++/* parse and output a UNISTR2 value */
++void parse_UNISTR2(FILE *fp, const unsigned char **p)
++{
++    uint32_t uni_max_len;
++    uint32_t offset;
++    uint32_t uni_str_len;
++    size_t i;
++
++    uni_max_len = load_32_le(*p); *p += 4;
++    offset = load_32_le(*p); *p += 4;
++    uni_str_len = load_32_le(*p); *p += 4;
++
++    for (i = 0; i < uni_str_len; i++)
++    {
++        fprintf(fp, "%c", **p);
++        *p += 2;
++    }
++    if (i % 2 == 1)
++    {
++        *p += 2;
++    }
++}
++
++/* parse and output a DOM_SID2 value */
++void parse_DOM_SID2(FILE *fp, const unsigned char **p)
++{
++    uint32_t num_auths;
++    uint8_t  sid_no;
++    uint8_t  num_auths2;
++    uint64_t id_auth;
++    uint32_t auth;
++    size_t i;
++
++    num_auths = load_32_le(*p); *p += 4;
++    sid_no = (uint8_t)(**p); *p += 1;
++    num_auths2 = (uint8_t)**p; *p += 1;
++    id_auth = load_48_be(*p); *p += 6;
++
++    fprintf(fp, "S-%u-%lu", sid_no, id_auth);
++
++    for (i = 0; i < num_auths2; i++)
++    {
++        auth = load_32_le(*p); *p += 4;
++        fprintf(fp, "-%u", auth);
++    }
++}
++
++/* parse and output SID or RID attributes */
++void parse_dom_attribute(FILE *fp, uint32_t attr)
++{
++    uint8_t listFlag = 0;
++    if (attr & SE_GROUP_MANDATORY)
++    {
++        fprintf(fp, "MANDATORY");
++        listFlag = 1;
++    }
++    if (attr & SE_GROUP_ENABLED_BY_DEFAULT)
++    {
++        fprintf(fp, "%sENABLED_BY_DEFAULT", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (attr & SE_GROUP_ENABLED)
++    {
++        fprintf(fp, "%sENABLED", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (attr & SE_GROUP_OWNER)
++    {
++        fprintf(fp, "%sOWNER", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (attr & SE_GROUP_USE_FOR_DENY_ONLY)
++    {
++        fprintf(fp, "%sUSE_FOR_DENY_ONLY", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (attr & SE_GROUP_INTEGRITY)
++    {
++        fprintf(fp, "%sINTEGRITY", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (attr & SE_GROUP_INTEGRITY_ENABLED)
++    {
++        fprintf(fp, "%sINTEGRITY_ENABLED", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    if (attr & SE_GROUP_RESOURCE)
++    {
++        fprintf(fp, "%sRESOURCE", listFlag == 1 ? "," : "");
++        listFlag = 1;
++    }
++    fprintf(fp, "%s%u", listFlag == 1 ? "," : "", ((attr & SE_GROUP_LOGON_ID) >> 30));
++}
++
++/* parse and output a RID with attributes */
++void parse_rid_with_attribute(FILE *fp, DOM_GID * rid)
++{
++    fprintf(fp,"<RID attributes=\"");
++    parse_dom_attribute(fp, rid->attr);
++    fprintf(fp,"\">%u</RID>\n", rid->g_rid);
++}
++
++/* parse and output a SID with attributes */
++void parse_sid_with_attribute(FILE *fp, const unsigned char **p, DOM_GID * rid)
++{
++    fprintf(fp,"<SID attributes=\"");
++    parse_dom_attribute(fp, rid->attr);
++    fprintf(fp,"\">");
++    parse_DOM_SID2(fp, p);
++    fprintf(fp,"</SID>\n", rid->g_rid);
++}
++
++
++/* parse and output the NET_USER_INFO_3 info buffer */
++int parse_logon_info(FILE *fp, const void *ptr, PAC_INFO_BUFFER * infoBuffer)
++{
++    const unsigned char *p = (const unsigned char *)ptr;
++    int64_t nt_time;
++    UNIHDR* hdr_user_name;
++    UNIHDR* hdr_full_name;
++    UNIHDR* hdr_logon_script;
++    UNIHDR* hdr_profile_path;
++    UNIHDR* hdr_home_dir;
++    UNIHDR* hdr_dir_drive;
++    UNIHDR* hdr_logon_srv;
++    UNIHDR* hdr_logon_dom;
++    uint32_t ptr_user_info;
++    uint32_t num_groups;
++    uint32_t buffer_groups;
++    uint32_t user_flgs;
++    uint8_t listFlag = 0;
++    uint32_t buffer_dom_id;
++    uint32_t num_other_sids;
++    uint32_t buffer_other_sids;
++    uint32_t num_groups2;
++    uint32_t num_sids;
++    DOM_GID *gids;
++    size_t i;
++
++    p += infoBuffer->Offset;
++
++    /* Common Type Header for the Serialization Stream
++     * http://msdn.microsoft.com/en-us/library/cc243890.aspx
++     */
++
++    if (*p != 0x01)   /* Version */
++    {
++        return PAC_DUMP_USER_INFO_VERSION_MISMATCH;
++    }
++    p++;
++
++    if (*p != 0x10)   /* Endianness */
++    {
++        return PAC_DUMP_USER_INFO_ENDIANESS_MISMATCH;
++    }
++    p++;
++
++    if (load_16_le(p) != 0x0008)   /* CommonHeaderLength  */
++    {
++        return PAC_DUMP_USER_INFO_COMMON_HEADER_LENGTH_MISMATCH;
++    }
++    p += 2;
++
++    if (load_32_le(p) != 0xCCCCCCCC)   /* Filler */
++    {
++        return PAC_DUMP_USER_INFO_FILLER_MISMATCH;
++    }
++    p += 4;
++
++
++    p += 4; /* length of the info buffer */
++    p += 4; /* is zero */
++
++    fprintf(fp,"<LogonInfo>\n");
++
++    ptr_user_info = load_32_le(p); p += 4;
++
++    fprintf(fp,"<UserInfo3 ");
++
++    parse_k5_time(fp, "LogonTime=\"%lu\" ", &p);
++    parse_k5_time(fp, "LogoffTime=\"%lu\" ", &p);
++    parse_k5_time(fp, "KickoffTime=\"%lu\" ", &p);
++    parse_k5_time(fp, "PasswordLastSetTime=\"%lu\" ", &p);
++    parse_k5_time(fp, "PasswordCanChangeTime=\"%lu\" ", &p);
++    parse_k5_time(fp, "PasswordMustChangeTime=\"%lu\" ", &p);
++
++    hdr_user_name = (UNIHDR *)p; p += sizeof(UNIHDR);
++    hdr_full_name = (UNIHDR *)p; p += sizeof(UNIHDR);
++    hdr_logon_script = (UNIHDR *)p; p += sizeof(UNIHDR);
++    hdr_profile_path = (UNIHDR *)p; p += sizeof(UNIHDR);
++    hdr_home_dir = (UNIHDR *)p; p += sizeof(UNIHDR);
++    hdr_dir_drive = (UNIHDR *)p; p += sizeof(UNIHDR);
++
++    parse_uint16(fp, "LogonCount=\"%u\" ", &p);
++    parse_uint16(fp, "BadPasswordCount=\"%u\" ", &p);
++    parse_uint32(fp, "UserRID=\"%u\" ", &p);
++    parse_uint32(fp, "GroupRID=\"%u\" ", &p);
++
++    num_groups = load_32_le(p); p += 4;
++    buffer_groups = load_32_le(p); p += 4;
++    user_flgs = load_32_le(p); p += 4;
++
++    fprintf(fp,"UserFlags=\"");
++    parse_user_flgs(fp, user_flgs);
++    fprintf(fp,"\" ");
++
++    fprintf(fp,"UserSessionKey=\"");
++    for (i = 0; i < 16; i++)
++    {
++        fprintf(fp,"%02X", *p++);
++    }
++    fprintf(fp,"\" ");
++
++    hdr_logon_srv = (UNIHDR *)p; p += sizeof(UNIHDR);
++    hdr_logon_dom = (UNIHDR *)p; p += sizeof(UNIHDR);
++
++    buffer_dom_id = load_32_le(p); p += 4;
++
++    /* Padding is type of LMSessKey
++     * currently I don't know for what this is.
++     * If you need it, implement it!
++LMSessKey: struct netr_LMSessionKey
++    key                      : 0000000000000000
++acct_flags               : 0x00000014 (20)
++       0: ACB_DISABLED
++       0: ACB_HOMDIRREQ
++       1: ACB_PWNOTREQ
++       0: ACB_TEMPDUP
++       1: ACB_NORMAL
++       0: ACB_MNS
++       0: ACB_DOMTRUST
++       0: ACB_WSTRUST
++       0: ACB_SVRTRUST
++       0: ACB_PWNOEXP
++       0: ACB_AUTOLOCK
++       0: ACB_ENC_TXT_PWD_ALLOWED
++       0: ACB_SMARTCARD_REQUIRED
++       0: ACB_TRUSTED_FOR_DELEGATION
++       0: ACB_NOT_DELEGATED
++       0: ACB_USE_DES_KEY_ONLY
++       0: ACB_DONT_REQUIRE_PREAUTH
++       0: ACB_PW_EXPIRED
++       0: ACB_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION
++       0: ACB_NO_AUTH_DATA_REQD
++       0: ACB_PARTIAL_SECRETS_ACCOUNT
++       0: ACB_USE_AES_KEYS
++unknown: ARRAY(7)
++    unknown                  : 0x00000000 (0)
++    unknown                  : 0x00000000 (0)
++    unknown                  : 0x00000000 (0)
++    unknown                  : 0x00000000 (0)
++    unknown                  : 0x00000000 (0)
++    unknown                  : 0x00000000 (0)
++    unknown                  : 0x00000000 (0)
++     */
++    fprintf(fp,"Padding=\"");
++    for (i = 0; i < 40; i++)
++    {
++        fprintf(fp,"%02X", *p++);
++    }
++    fprintf(fp,"\" ");
++
++    num_other_sids = load_32_le(p); p += 4;
++    buffer_other_sids = load_32_le(p); p += 4;
++
++    /* Step Over next UNISTR2 element.
++     * This element is referenced by the ptr_user_info, it should be empty.
++     */
++    parse_UNISTR2(fp, &p);
++
++    fprintf(fp,"UserName=\"");
++    parse_UNISTR2(fp, &p);
++    fprintf(fp,"\" UserFullName=\"");
++    parse_UNISTR2(fp, &p);
++    fprintf(fp,"\" LogonScript=\"");
++    parse_UNISTR2(fp, &p);
++    fprintf(fp,"\" ProfilePath=\"");
++    parse_UNISTR2(fp, &p);
++    fprintf(fp,"\" HomeDir=\"");
++    parse_UNISTR2(fp, &p);
++    fprintf(fp,"\" DirDrive=\"");
++    parse_UNISTR2(fp, &p);
++    fprintf(fp,"\" ");
++
++    num_groups2 = load_32_le(p); p += 4;
++    gids = (DOM_GID *)p;
++    p += sizeof(DOM_GID) * num_groups2;
++
++    fprintf(fp,"LogonServer=\"");
++    parse_UNISTR2(fp, &p);
++    fprintf(fp,"\" LogonDomain=\"");
++    parse_UNISTR2(fp, &p);
++    fprintf(fp,"\" DomainSID=\"");
++    parse_DOM_SID2(fp, &p);
++    fprintf(fp,"\">\n");
++
++    fprintf(fp,"<GroupRID>\n");
++    for (i = 0; i < num_groups2; i++)
++    {
++        parse_rid_with_attribute(fp, &gids[i]);
++    }
++    num_sids = load_32_le(p); p += 4;
++    fprintf(fp,"</GroupRID>\n");
++
++    gids = (DOM_GID *)p;
++    p += sizeof(DOM_GID) * num_sids;
++
++    fprintf(fp,"<ExtraSID>\n");
++    for (i = 0; i < num_sids; i++)
++    {
++        parse_sid_with_attribute(fp, &p, &gids[i]);
++    }
++    fprintf(fp,"</ExtraSID>\n");
++
++    fprintf(fp, "</UserInfo3>\n");
++
++    /* Not implemented Resource Group, because I don't have that.
++     * PSID ResourceGroupDomainSid;
++     * ULONG ResourceGroupCount;
++     * [size_is(ResourceGroupCount)] PGROUP_MEMBERSHIP ResourceGroupIds;
++     */
++
++    fprintf(fp, "</LogonInfo>\n");
++
++    return PAC_DUMP_OK;
++}
++
++/* check the file modified time and the existance of the output xml */
++int check_file(const char* filename, int32_t cache_time)
++{
++    struct stat buffer;
++    int exist = stat(filename, &buffer);
++    time_t now;
++    time(&now);
++    if(exist == 0)
++    {
++        if (buffer.st_mtime + cache_time < time(NULL))
++        {
++            return 0;
++        }
++        return 1;
++    }
++    else // -1
++        return 0;
++}
++
++int pac_to_xml_file(size_t length, void *buffer, const char *filename, int32_t cache_time)
++{
++    PACTYPE *ppac_header;
++    FILE *outFile;
++    size_t i;
++
++    if(check_file(filename, cache_time))
++    {
++        return PAC_DUMP_OK;
++    }
++
++    outFile = fopen(filename, "w");
++    if (!outFile)
++    {
++        return PAC_DUMP_UNABLE_TO_OPEN_FILE;
++    }
++
++    fprintf(outFile, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
++    fprintf(outFile, "<PAC>\n");
++
++    ppac_header = parse_pac_header(buffer, length);
++    if (ppac_header != NULL)
++    {
++        for (i = 0; i < ppac_header->cBuffers; i++)
++        {
++            switch (ppac_header->Buffers[i].ulType)
++            {
++                case KRB5_PAC_LOGON_INFO:
++                    parse_logon_info(outFile, buffer,  &ppac_header->Buffers[i]);
++                    break;
++                case KRB5_PAC_CREDENTIALS_INFO:
++                    break;
++                case KRB5_PAC_SERVER_CHECKSUM:
++                    parse_checksum(outFile, buffer,  &ppac_header->Buffers[i], "ServerCheckSum");
++                    break;
++                case KRB5_PAC_PRIVSVR_CHECKSUM:
++                    parse_checksum(outFile, buffer, &ppac_header->Buffers[i], "PrivateServerCheckSum");
++                    break;
++                case KRB5_PAC_CLIENT_INFO:
++                    parse_client_info(outFile, buffer, &ppac_header->Buffers[i]);
++                    break;
++                case KRB5_PAC_DELEGATION_INFO:
++                    break;
++                case KRB5_PAC_UPN_DNS_INFO:
++                    parse_upn_dns_info(outFile, buffer, &ppac_header->Buffers[i]);
++                    break;
++                default:
++                    break;
++            }
++        }
++        free(ppac_header);
++    }
++    fprintf(outFile, "</PAC>\n");
++    fclose(outFile);
++
++    return PAC_DUMP_OK;
++}
++
+diff -rupN a/src/pac_xml_dump.h b/src/pac_xml_dump.h
+--- a/src/pac_xml_dump.h	1970-01-01 01:00:00.000000000 +0100
++++ b/src/pac_xml_dump.h	2014-11-24 15:17:22.000000000 +0100
+@@ -0,0 +1,49 @@
++/*
++ * Copyright (C) 2014 Sven Fabricius <sven.fabricius{at}livediesel[dot]de>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ */
++
++#ifndef PAC_XML_DUMP_H_
++#define PAC_XML_DUMP_H_
++
++#define PAC_DUMP_OK                                       0
++
++/* NET_USER_INFO_3 version mismatch */
++#define PAC_DUMP_USER_INFO_VERSION_MISMATCH               -1
++
++/* NET_USER_INFO_3 endianess mismatch */
++#define PAC_DUMP_USER_INFO_ENDIANESS_MISMATCH             -2
++
++/* NET_USER_INFO_3 common header length mismatch */
++#define PAC_DUMP_USER_INFO_COMMON_HEADER_LENGTH_MISMATCH  -3
++
++/* NET_USER_INFO_3 filler mismatch */
++#define PAC_DUMP_USER_INFO_FILLER_MISMATCH                -4
++
++/* Unable to open file */
++#define PAC_DUMP_UNABLE_TO_OPEN_FILE                      -5
++
++int pac_to_xml_file(size_t length, void *buffer, const char *filename, int32_t cache_time);
++
++#endif /* PAC_XML_DUMP_H_ */
